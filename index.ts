@@ -1,34 +1,63 @@
-require('dotenv').config();
-const express = require('express');
-const mongoose = require('mongoose');
-const cors = require('cors');
-const bcrypt = require('bcryptjs');
-const jwt = require('jsonwebtoken');
-const axios = require('axios');
-const Stripe = require('stripe');
-const multer = require('multer');
-const { User, Service, Booking, Payment } = require('./models');
-const { verifyToken, verifyCustomer, verifyTechnician, verifyAdmin } = require('./middleware');
+import 'dotenv/config';
+import express from 'express';
+import mongoose from 'mongoose';
+import cors from 'cors';
+import axios from 'axios';
+import Stripe from 'stripe';
+import multer from 'multer';
+import { toNodeHandler } from 'better-auth/node';
+import { auth } from './auth.js';
+import { User, Service, Booking, Payment, type UserRecord, type ServiceFilter, type ServiceRecord } from './models.js';
+import { verifyToken, verifyCustomer, verifyTechnician, verifyAdmin } from './middleware.js';
 
 const app = express();
-app.use(cors({ origin: (process.env.CLIENT_URL || 'http://localhost:5173').split(','), credentials: true }));
+const clientOrigins = (process.env.CLIENT_URL || 'http://localhost:5173').split(',').map((origin) => origin.trim());
+const clientUrl = clientOrigins[0];
+app.use(cors({ origin: clientOrigins, credentials: true }));
 app.use('/api/payments/webhook', express.raw({ type: 'application/json' }));
+app.all('/api/auth/*splat', toNodeHandler(auth));
 app.use(express.json({ limit: '10mb' }));
 
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024 } });
-const stripe = process.env.STRIPE_SECRET_KEY ? Stripe(process.env.STRIPE_SECRET_KEY) : null;
+const stripe = process.env.STRIPE_SECRET_KEY ? new Stripe(process.env.STRIPE_SECRET_KEY) : null;
 
-const signToken = (user) => jwt.sign({ id: user._id, email: user.email, role: user.role, name: user.name }, process.env.JWT_SECRET, { expiresIn: '7d' });
-const publicUser = (u) => ({ id: u._id, name: u.name, email: u.email, image: u.image, role: u.role, phone: u.phone, area: u.area, bio: u.bio });
+const publicUser = (user: UserRecord | null) => user && ({
+  id: user._id.toString(),
+  name: user.name,
+  email: user.email,
+  image: user.image,
+  role: user.role,
+  phone: user.phone,
+  area: user.area,
+  bio: user.bio,
+});
 
 async function seed() {
   if (await User.countDocuments()) return;
-  const hash = (s) => bcrypt.hashSync(s, 10);
-  const tech1 = await User.create({ name: 'Arif Rahman', email: 'tech@fixmate.test', password: hash('Tech123'), role: 'technician', phone: '01700000001', area: 'Dhanmondi, Dhaka', bio: 'Certified technician with 8 years of repair experience.', image: 'https://i.pravatar.cc/300?img=12' });
-  const tech2 = await User.create({ name: 'Nadia Islam', email: 'nadia@fixmate.test', password: hash('Tech123'), role: 'technician', phone: '01700000002', area: 'Mirpur, Dhaka', bio: 'Home appliance and electrical specialist.', image: 'https://i.pravatar.cc/300?img=47' });
-  await User.create({ name: 'FixMate Admin', email: 'admin@fixmate.test', password: hash('Admin123'), role: 'admin', image: 'https://i.pravatar.cc/300?img=11' });
-  const customer = await User.create({ name: 'Tahsin Ahmed', email: 'customer@fixmate.test', password: hash('Customer123'), role: 'customer', phone: '01800000000', area: 'Uttara, Dhaka', image: 'https://i.pravatar.cc/300?img=33' });
-  const serviceData = [
+  const createAccount = async (account: {
+    name: string;
+    email: string;
+    password: string;
+    role: 'customer' | 'technician' | 'admin';
+    phone?: string;
+    area?: string;
+    bio?: string;
+    image?: string;
+  }) => {
+    await auth.api.signUpEmail({ body: { name: account.name, email: account.email, password: account.password } });
+    const user = await User.findOneAndUpdate(
+      { email: account.email },
+      { $set: { role: account.role, phone: account.phone || '', area: account.area || '', bio: account.bio || '', image: account.image || '' } },
+      { new: true },
+    );
+    if (!user) throw new Error(`Could not create seed account ${account.email}`);
+    return user;
+  };
+  const tech1 = await createAccount({ name: 'Arif Rahman', email: 'tech@fixmate.test', password: 'Tech123', role: 'technician', phone: '01700000001', area: 'Dhanmondi, Dhaka', bio: 'Certified technician with 8 years of repair experience.', image: 'https://i.pravatar.cc/300?img=12' });
+  const tech2 = await createAccount({ name: 'Nadia Islam', email: 'nadia@fixmate.test', password: 'Tech123', role: 'technician', phone: '01700000002', area: 'Mirpur, Dhaka', bio: 'Home appliance and electrical specialist.', image: 'https://i.pravatar.cc/300?img=47' });
+  await createAccount({ name: 'FixMate Admin', email: 'admin@fixmate.test', password: 'Admin123', role: 'admin', image: 'https://i.pravatar.cc/300?img=11' });
+  const customer = await createAccount({ name: 'Tahsin Ahmed', email: 'customer@fixmate.test', password: 'Customer123', role: 'customer', phone: '01800000000', area: 'Uttara, Dhaka', image: 'https://i.pravatar.cc/300?img=33' });
+  const serviceData: [string, string, number, ServiceRecord['serviceMode']][] = [
     ['iPhone Screen Replacement', 'Smartphone', 129, 'Home Visit'],
     ['Android Phone Repair', 'Smartphone', 89, 'Shop Drop-off'],
     ['Laptop Diagnostic & Cleaning', 'Laptop & PC', 79, 'Shop Drop-off'],
@@ -83,27 +112,15 @@ async function seed() {
   console.log('Seed data created');
 }
 
-app.post('/api/auth/register', async (req, res) => {
-  try {
-    const { name, email, password, role = 'customer' } = req.body;
-    if (!name || !email || !password) return res.status(400).json({ message: 'All required fields must be provided' });
-    if (password.length < 6 || !/[A-Z]/.test(password) || !/[a-z]/.test(password)) return res.status(400).json({ message: 'Password must meet requirements' });
-    if (await User.findOne({ email: email.toLowerCase() })) return res.status(409).json({ message: 'Email already exists' });
-    const safeRole = ['customer', 'technician'].includes(role) ? role : 'customer';
-    const user = await User.create({ name, email: email.toLowerCase(), password: await bcrypt.hash(password, 10), role: safeRole });
-    res.status(201).json({ token: signToken(user), user: publicUser(user) });
-  } catch (error) { res.status(400).json({ message: error.message }); }
-});
-
-app.post('/api/auth/login', async (req, res) => {
-  const { email, password } = req.body;
-  const user = await User.findOne({ email: (email || '').toLowerCase() });
-  if (!user || !(await bcrypt.compare(password || '', user.password))) return res.status(401).json({ message: 'Invalid email or password' });
-  res.json({ token: signToken(user), user: publicUser(user) });
-});
-
-app.get('/api/auth/me', verifyToken, async (req, res) => {
+app.get('/api/me', verifyToken, async (req, res) => {
   const user = await User.findById(req.user.id);
+  res.json(publicUser(user));
+});
+
+app.patch('/api/profile/role', verifyToken, async (req, res) => {
+  if (!['customer', 'technician'].includes(req.body.role)) return res.status(400).json({ message: 'Invalid role' });
+  const user = await User.findByIdAndUpdate(req.user.id, { role: req.body.role }, { new: true, runValidators: true });
+  if (!user) return res.status(404).json({ message: 'User not found' });
   res.json(publicUser(user));
 });
 
@@ -125,12 +142,17 @@ app.post('/api/upload/image', verifyToken, upload.single('image'), async (req, r
 });
 
 app.get('/api/services', async (req, res) => {
-  const { search = '', category = '', mode = '', sort = 'newest', page = 1, limit = 12 } = req.query;
-  const filter = { approvalStatus: 'approved', isAvailable: true };
+  const search = typeof req.query.search === 'string' ? req.query.search : '';
+  const category = typeof req.query.category === 'string' ? req.query.category : '';
+  const mode = typeof req.query.mode === 'string' ? req.query.mode : '';
+  const sort = typeof req.query.sort === 'string' ? req.query.sort : 'newest';
+  const page = typeof req.query.page === 'string' ? req.query.page : '1';
+  const limit = typeof req.query.limit === 'string' ? req.query.limit : '12';
+  const filter: ServiceFilter = { approvalStatus: 'approved', isAvailable: true };
   if (search) filter.$or = [{ title: { $regex: search, $options: 'i' } }, { category: { $regex: search, $options: 'i' } }];
   if (category) filter.category = category;
-  if (mode) filter.serviceMode = mode;
-  const sortMap = { low: { basePrice: 1 }, high: { basePrice: -1 }, newest: { createdAt: -1 } };
+  if (mode === 'Home Visit' || mode === 'Shop Drop-off') filter.serviceMode = mode;
+  const sortMap: Record<string, Record<string, 1 | -1>> = { low: { basePrice: 1 }, high: { basePrice: -1 }, newest: { createdAt: -1 } };
   const pageNumber = Math.max(Number(page) || 1, 1);
   const pageSize = Math.min(Math.max(Number(limit) || 12, 1), 50);
   const [items, total] = await Promise.all([
@@ -149,7 +171,6 @@ app.get('/api/services/:id', async (req, res) => {
 });
 
 app.post('/api/services', verifyToken, verifyTechnician, async (req, res) => {
-  const count = await Service.countDocuments({ technicianEmail: req.user.email });
   if (req.body.basePrice === undefined) return res.status(400).json({ message: 'Invalid service' });
   const data = { ...req.body, technicianName: req.user.name, technicianEmail: req.user.email, approvalStatus: 'pending', isAvailable: true };
   const service = await Service.create(data);
@@ -182,7 +203,7 @@ app.post('/api/bookings', verifyToken, verifyCustomer, async (req, res) => {
   if (!req.body.address || !req.body.problemDescription || req.body.problemDescription.length < 20) return res.status(400).json({ message: 'Complete the repair request details' });
   const preferredDate = new Date(req.body.preferredDate);
   const today = new Date(); today.setHours(0, 0, 0, 0);
-  if (Number.isNaNaN(preferredDate.getTime()) || preferredDate < today) return res.status(400).json({ message: 'Preferred date must be today or later' });
+  if (Number.isNaN(preferredDate.getTime()) || preferredDate < today) return res.status(400).json({ message: 'Preferred date must be today or later' });
   const active = await Booking.findOne({ serviceId: service._id.toString(), customerEmail: req.user.email, status: { $in: ['requested', 'accepted', 'in-progress'] } });
   if (active) return res.status(409).json({ message: 'You already have an active request for this service' });
   const booking = await Booking.create({
@@ -231,8 +252,8 @@ app.post('/api/payments/create-checkout-session', verifyToken, verifyCustomer, a
   const session = await stripe.checkout.sessions.create({
     mode: 'payment',
     line_items: [{ price_data: { currency: 'usd', product_data: { name: booking.serviceTitle }, unit_amount: Math.round(booking.finalAmount * 100) }, quantity: 1 }],
-    success_url: `${process.env.CLIENT_URL}/payment/success?session_id={CHECKOUT_SESSION_ID}`,
-    cancel_url: `${process.env.CLIENT_URL}/payment/cancel`,
+    success_url: `${clientUrl}/payment/success?session_id={CHECKOUT_SESSION_ID}`,
+    cancel_url: `${clientUrl}/payment/cancel`,
     metadata: { bookingId: booking._id.toString(), customerEmail: booking.customerEmail },
   });
   res.json({ url: session.url });
@@ -256,7 +277,9 @@ async function savePayment(session) {
 
 app.get('/api/payments/verify', verifyToken, verifyCustomer, async (req, res) => {
   if (!stripe) return res.status(503).json({ message: 'Stripe is not configured' });
-  const session = await stripe.checkout.sessions.retrieve(req.query.session_id);
+  const sessionId = typeof req.query.session_id === 'string' ? req.query.session_id : '';
+  if (!sessionId) return res.status(400).json({ message: 'Missing Stripe session ID' });
+  const session = await stripe.checkout.sessions.retrieve(sessionId);
   if (session.payment_status !== 'paid' || session.metadata.customerEmail !== req.user.email) return res.status(400).json({ message: 'Payment is not paid or does not belong to you' });
   const payment = await savePayment(session);
   res.json(payment);
@@ -267,8 +290,10 @@ app.get('/api/payments/my', verifyToken, verifyCustomer, async (req, res) =>
 
 app.post('/api/payments/webhook', async (req, res) => {
   if (!stripe || !process.env.STRIPE_WEBHOOK_SECRET) return res.status(400).json({ message: 'Webhook not configured' });
+  const signature = req.headers['stripe-signature'];
+  if (typeof signature !== 'string') return res.status(400).json({ message: 'Missing Stripe signature' });
   let event;
-  try { event = stripe.webhooks.constructEvent(req.body, req.headers['stripe-signature'], process.env.STRIPE_WEBHOOK_SECRET); }
+  try { event = stripe.webhooks.constructEvent(req.body, signature, process.env.STRIPE_WEBHOOK_SECRET); }
   catch (error) { return res.status(400).send(`Webhook Error: ${error.message}`); }
   if (event.type === 'checkout.session.completed') await savePayment(event.data.object);
   res.json({ received: true });
@@ -311,7 +336,7 @@ app.get('/api/customer/stats', verifyToken, verifyCustomer, async (req, res) => 
 
 app.use((req, res) => res.status(404).json({ message: 'API route not found' }));
 
-mongoose.connect(process.env.MONGODB_URI).then(async () => {
+mongoose.connect(process.env.MONGODB_URI || 'mongodb://localhost:27017/fixmate').then(async () => {
   await seed();
   const port = process.env.PORT || 5000;
   app.listen(port, () => console.log(`FixMate server running on port ${port}`));

@@ -1,17 +1,50 @@
-const mongoose = require('mongoose');
+import mongoose, { Schema, type QueryFilter, type Types } from 'mongoose';
 
-const userSchema = new mongoose.Schema({
+export type UserRole = 'customer' | 'technician' | 'admin';
+
+export interface UserRecord {
+  _id: Types.ObjectId;
+  name: string;
+  email: string;
+  image: string;
+  role: UserRole;
+  phone: string;
+  area: string;
+  bio: string;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+const userSchema = new Schema<UserRecord>({
   name: { type: String, required: true },
   email: { type: String, required: true, unique: true, lowercase: true, trim: true },
-  password: { type: String, required: true },
   image: { type: String, default: '' },
   role: { type: String, enum: ['customer', 'technician', 'admin'], default: 'customer' },
   phone: { type: String, default: '' },
   area: { type: String, default: '' },
   bio: { type: String, default: '' },
-}, { timestamps: true });
+}, { timestamps: true, strict: false, versionKey: false });
 
-const serviceSchema = new mongoose.Schema({
+export interface ServiceRecord {
+  title: string;
+  category: string;
+  description: string;
+  image: string;
+  basePrice: number;
+  estimatedDuration: string;
+  serviceMode: 'Home Visit' | 'Shop Drop-off';
+  serviceArea: string;
+  technicianName: string;
+  technicianEmail: string;
+  approvalStatus: 'pending' | 'approved' | 'rejected';
+  isAvailable: boolean;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+export type ServiceFilter = QueryFilter<ServiceRecord>;
+
+const serviceSchema = new Schema<ServiceRecord>({
   title: { type: String, required: true },
   category: { type: String, required: true },
   description: { type: String, required: true },
@@ -26,7 +59,7 @@ const serviceSchema = new mongoose.Schema({
   isAvailable: { type: Boolean, default: true },
 }, { timestamps: true });
 
-const bookingSchema = new mongoose.Schema({
+const bookingSchema = new Schema({
   serviceId: { type: String, required: true },
   serviceTitle: String,
   serviceImage: String,
@@ -48,7 +81,7 @@ const bookingSchema = new mongoose.Schema({
   review: String,
 }, { timestamps: true });
 
-const paymentSchema = new mongoose.Schema({
+const paymentSchema = new Schema({
   bookingId: { type: String, required: true, unique: true },
   serviceTitle: String,
   customerName: String,
@@ -63,9 +96,7 @@ const paymentSchema = new mongoose.Schema({
   paidAt: { type: Date, default: Date.now },
 }, { timestamps: true });
 
-module.exports = {
-  User: mongoose.model('User', userSchema),
-  Service: mongoose.model('Service', serviceSchema),
-  Booking: mongoose.model('Booking', bookingSchema),
-  Payment: mongoose.model('Payment', paymentSchema),
-};
+export const User = mongoose.model<UserRecord>('FixMateUser', userSchema, 'user');
+export const Service = mongoose.model<ServiceRecord>('Service', serviceSchema);
+export const Booking = mongoose.model('Booking', bookingSchema);
+export const Payment = mongoose.model('Payment', paymentSchema);
